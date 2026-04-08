@@ -1,0 +1,400 @@
+class rob_driver extends uvm_driver #(rob_transaction);
+    `uvm_component_utils(rob_driver)
+
+    virtual rob_if.DRV vif;
+
+    // ============================================================
+    // Shadow tracking — mirror trạng thái ROB phía TB
+    // Dùng để sequence kiểm tra rule trước khi gửi stimulus.
+    // Driver cập nhật tracking SAU mỗi transaction.
+    //
+    // Không thay đổi interface RTL — chỉ thêm logic nội bộ.
+    // ============================================================
+    bit        entry_valid    [128];
+    bit        entry_busy     [128];
+    bit [6:0]  entry_pdst     [128];
+    bit        entry_ldst_val [128];
+    bit        entry_unsafe   [128];
+    bit        entry_is_fence [128];
+
+    function new(string name, uvm_component parent);
+      super.new(name, parent);
+    endfunction
+
+    function void build_phase(uvm_phase phase);
+      super.build_phase(phase);
+      if (!uvm_config_db#(virtual rob_if.DRV)::get(this, "", "vif", vif))
+        `uvm_fatal("DRV", "Could not get virtual interface 'vif'")
+      reset_tracking();
+    endfunction
+
+    function void reset_tracking();
+      for (int i = 0; i < 128; i++) begin
+        entry_valid[i]    = 0;
+        entry_busy[i]     = 0;
+        entry_pdst[i]     = 0;
+        entry_ldst_val[i] = 0;
+        entry_unsafe[i]   = 0;
+        entry_is_fence[i] = 0;
+      end
+    endfunction
+
+    task run_phase(uvm_phase phase);
+      rob_transaction tr;
+      @(negedge vif.reset);
+      reset_tracking();
+      repeat (2) @(posedge vif.clock);
+      forever begin
+        seq_item_port.get_next_item(tr);
+        drive(tr);
+        seq_item_port.item_done();
+      end
+    endtask
+
+    // ==========================================================
+    // Main drive — cấu trúc giống bản cũ, thêm tracking update
+    // ==========================================================
+    task drive(rob_transaction tr);
+      clear_all();
+      case (tr.op)
+        ROB_DISPATCH: begin
+          drive_dispatch(tr);
+          @(posedge vif.clock);
+          track_dispatch(tr);     // <<< NEW: cập nhật shadow state
+          deassert_enq();
+        end
+        ROB_WRITEBACK: begin
+          drive_writeback(tr);
+          @(posedge vif.clock);
+          track_writeback(tr);    // <<< NEW
+          deassert_wb();
+        end
+        ROB_BRANCH_UPDATE: begin
+          drive_branch_update(tr);
+          @(posedge vif.clock);
+          if (tr.br_mispredict)
+            track_branch_kill(tr); // <<< NEW
+          deassert_brupdate();
+        end
+        ROB_LXCPT: begin
+          drive_lxcpt(tr);
+          @(posedge vif.clock);
+          deassert_lxcpt();
+        end
+        ROB_LSU_CLR_BSY: begin
+          drive_lsu_clr(tr);
+          @(posedge vif.clock);
+          track_lsu_clr(tr);     // <<< NEW
+          deassert_lsu_clr();
+        end
+        ROB_IDLE: begin
+          @(posedge vif.clock);
+        end
+      endcase
+      // Commit làm entry invalid — track qua monitor output
+      track_commit();
+    endtask
+
+    // ==========================================================
+    // Shadow state updates
+    // ==========================================================
+
+    // Sau dispatch: đánh dấu entry valid + busy
+    function void track_dispatch(rob_transaction tr);
+      for (int b = 0; b < 4; b++) begin
+        if (tr.enq_valids[b]) begin
+          int idx = tr.enq_uops_rob_idx[b];
+          entry_valid[idx]    = 1;
+          // [D5] fence/fencei: busy = 0 ngay từ dispatch
+          entry_busy[idx]     = !(tr.enq_uops_is_fence[b] || tr.enq_uops_is_fencei[b]);
+          entry_pdst[idx]     = tr.enq_uops_pdst[b];
+          entry_ldst_val[idx] = tr.enq_uops_ldst_val[b];
+          entry_unsafe[idx]   = tr.enq_uops_unsafe[b];
+          entry_is_fence[idx] = tr.enq_uops_is_fence[b] || tr.enq_uops_is_fencei[b];
+        end
+      end
+    endfunction
+
+    // Sau writeback: clear busy
+    function void track_writeback(rob_transaction tr);
+      for (int i = 0; i < 10; i++) begin
+        if (tr.wb_valid[i]) begin
+          int idx = tr.wb_rob_idx[i];
+          entry_busy[idx]   = 0;
+          entry_unsafe[idx] = 0;
+        end
+      end
+    endfunction
+
+    // Sau branch kill: invalidate entry có matching br_mask
+    // Đơn giản hóa: kill tất cả entry sau branch rob_idx
+    // (trong pipeline thật dùng br_mask match, TB dùng heuristic)
+    function void track_branch_kill(rob_transaction tr);
+      for (int i = 0; i < 128; i++) begin
+        // Heuristic: entry valid với rob_idx > branch rob_idx bị kill
+        // (không hoàn toàn chính xác nhưng đủ safe — worst case
+        //  TB bỏ sót vài entry, assertion trên DUT sẽ bắt)
+        if (entry_valid[i] && i > tr.br_rob_idx)
+          entry_valid[i] = 0;
+      end
+    endfunction
+
+    // Sau lsu_clr_bsy: clear busy cho store entry
+    function void track_lsu_clr(rob_transaction tr);
+      for (int i = 0; i < 3; i++) begin
+        if (tr.lsu_clr_valid[i]) begin
+          int idx = tr.lsu_clr_bits[i];
+          entry_busy[idx]   = 0;
+          entry_unsafe[idx] = 0;
+        end
+      end
+    endfunction
+
+    // Mỗi cycle: nếu DUT commit → entry freed
+    function void track_commit();
+      for (int w = 0; w < 4; w++) begin
+        if (vif.drv_cb.commit_valids[w]) begin
+          // Head entry committed — nhưng ta không biết chính xác rob_idx
+          // từ commit output. Dùng head_idx làm proxy.
+          // (Tracking gần đúng — DUT assertion là source of truth)
+        end
+      end
+      // Khi ROB flush (exception), reset toàn bộ tracking
+      if (vif.drv_cb.flush_valid)
+        reset_tracking();
+    endfunction
+
+    // ==========================================================
+    // Query functions — sequence gọi để kiểm tra rule
+    // ==========================================================
+
+    // [D1] Entry tại rob_idx có đang valid không?
+    function bit is_entry_valid(int idx);
+      return entry_valid[idx];
+    endfunction
+
+    // [W1] Entry valid? [W2] Entry busy?
+    function bit can_writeback(int idx);
+      return entry_valid[idx] && entry_busy[idx];
+    endfunction
+
+    // [W3] pdst có khớp không?
+    function bit check_pdst_match(int idx, bit [6:0] pdst);
+      if (!entry_ldst_val[idx]) return 1; // no dest → always ok
+      return (entry_pdst[idx] == pdst);
+    endfunction
+
+    // [D5] Entry là fence? (không cần WB)
+    function bit is_fence_entry(int idx);
+      return entry_is_fence[idx];
+    endfunction
+
+    // Entry unsafe? (cho lxcpt check)
+    function bit is_entry_unsafe(int idx);
+      return entry_unsafe[idx];
+    endfunction
+
+    // ==========================================================
+    // Deassert tasks — giữ nguyên bản cũ
+    // ==========================================================
+    task deassert_enq();
+      for (int i = 0; i < 4; i++) begin
+        vif.drv_cb.enq_valids[i]              <= 1'b0;
+        vif.drv_cb.enq_uops_uopc[i]           <= 0;
+        vif.drv_cb.enq_uops_debug_inst[i]     <= 0;
+        vif.drv_cb.enq_uops_is_rvc[i]         <= 0;
+        vif.drv_cb.enq_uops_is_br[i]          <= 0;
+        vif.drv_cb.enq_uops_is_jalr[i]        <= 0;
+        vif.drv_cb.enq_uops_is_jal[i]         <= 0;
+        vif.drv_cb.enq_uops_br_mask[i]        <= 0;
+        vif.drv_cb.enq_uops_ftq_idx[i]        <= 0;
+        vif.drv_cb.enq_uops_edge_inst[i]      <= 0;
+        vif.drv_cb.enq_uops_pc_lob[i]         <= 0;
+        vif.drv_cb.enq_uops_rob_idx[i]        <= 0;
+        vif.drv_cb.enq_uops_pdst[i]           <= 0;
+        vif.drv_cb.enq_uops_stale_pdst[i]     <= 0;
+        vif.drv_cb.enq_uops_exception[i]      <= 0;
+        vif.drv_cb.enq_uops_exc_cause[i]      <= 0;
+        vif.drv_cb.enq_uops_is_fence[i]       <= 0;
+        vif.drv_cb.enq_uops_is_fencei[i]      <= 0;
+        vif.drv_cb.enq_uops_uses_ldq[i]       <= 0;
+        vif.drv_cb.enq_uops_uses_stq[i]       <= 0;
+        vif.drv_cb.enq_uops_is_sys_pc2epc[i]  <= 0;
+        vif.drv_cb.enq_uops_is_unique[i]      <= 0;
+        vif.drv_cb.enq_uops_flush_on_commit[i]<= 0;
+        vif.drv_cb.enq_uops_ldst[i]           <= 0;
+        vif.drv_cb.enq_uops_ldst_val[i]       <= 0;
+        vif.drv_cb.enq_uops_dst_rtype[i]      <= 0;
+        vif.drv_cb.enq_uops_fp_val[i]         <= 0;
+        vif.drv_cb.enq_uops_debug_fsrc[i]     <= 0;
+        vif.drv_cb.enq_uops_unsafe[i]         <= 0;
+      end
+      vif.drv_cb.enq_partial_stall <= 1'b0;
+    endtask
+
+    task deassert_wb();
+      for (int i = 0; i < 10; i++) begin
+        vif.drv_cb.wb_resps_valid[i]       <= 1'b0;
+        vif.drv_cb.wb_resps_rob_idx[i]     <= 0;
+        vif.drv_cb.wb_resps_pdst[i]        <= 0;
+        vif.drv_cb.wb_resps_predicated[i]  <= 0;
+        vif.drv_cb.debug_wb_valids[i]      <= 1'b0;
+      end
+    endtask
+
+    task deassert_brupdate();
+      vif.drv_cb.brupdate_b1_resolve_mask    <= 0;
+      vif.drv_cb.brupdate_b1_mispredict_mask <= 0;
+      vif.drv_cb.brupdate_b2_uop_rob_idx     <= 0;
+      vif.drv_cb.brupdate_b2_mispredict       <= 1'b0;
+      vif.drv_cb.brupdate_b2_taken            <= 1'b0;
+    endtask
+
+    task deassert_lxcpt();
+      vif.drv_cb.lxcpt_valid              <= 1'b0;
+      vif.drv_cb.lxcpt_bits_uop_br_mask   <= 0;
+      vif.drv_cb.lxcpt_bits_uop_rob_idx   <= 0;
+      vif.drv_cb.lxcpt_bits_cause          <= 0;
+      vif.drv_cb.lxcpt_bits_badvaddr       <= 0;
+    endtask
+
+    task deassert_lsu_clr();
+      for (int i = 0; i < 3; i++) begin
+        vif.drv_cb.lsu_clr_bsy_valid[i] <= 1'b0;
+        vif.drv_cb.lsu_clr_bsy_bits[i]  <= 0;
+      end
+    endtask
+
+    // ==========================================================
+    // Clear ALL — giữ nguyên bản cũ
+    // ==========================================================
+    task clear_all();
+      for (int i = 0; i < 4; i++) begin
+        vif.drv_cb.enq_valids[i]              <= 0;
+        vif.drv_cb.enq_uops_uopc[i]           <= 0;
+        vif.drv_cb.enq_uops_debug_inst[i]     <= 0;
+        vif.drv_cb.enq_uops_is_rvc[i]         <= 0;
+        vif.drv_cb.enq_uops_is_br[i]          <= 0;
+        vif.drv_cb.enq_uops_is_jalr[i]        <= 0;
+        vif.drv_cb.enq_uops_is_jal[i]         <= 0;
+        vif.drv_cb.enq_uops_br_mask[i]        <= 0;
+        vif.drv_cb.enq_uops_ftq_idx[i]        <= 0;
+        vif.drv_cb.enq_uops_edge_inst[i]      <= 0;
+        vif.drv_cb.enq_uops_pc_lob[i]         <= 0;
+        vif.drv_cb.enq_uops_rob_idx[i]        <= 0;
+        vif.drv_cb.enq_uops_pdst[i]           <= 0;
+        vif.drv_cb.enq_uops_stale_pdst[i]     <= 0;
+        vif.drv_cb.enq_uops_exception[i]      <= 0;
+        vif.drv_cb.enq_uops_exc_cause[i]      <= 0;
+        vif.drv_cb.enq_uops_is_fence[i]       <= 0;
+        vif.drv_cb.enq_uops_is_fencei[i]      <= 0;
+        vif.drv_cb.enq_uops_uses_ldq[i]       <= 0;
+        vif.drv_cb.enq_uops_uses_stq[i]       <= 0;
+        vif.drv_cb.enq_uops_is_sys_pc2epc[i]  <= 0;
+        vif.drv_cb.enq_uops_is_unique[i]      <= 0;
+        vif.drv_cb.enq_uops_flush_on_commit[i]<= 0;
+        vif.drv_cb.enq_uops_ldst[i]           <= 0;
+        vif.drv_cb.enq_uops_ldst_val[i]       <= 0;
+        vif.drv_cb.enq_uops_dst_rtype[i]      <= 0;
+        vif.drv_cb.enq_uops_fp_val[i]         <= 0;
+        vif.drv_cb.enq_uops_debug_fsrc[i]     <= 0;
+        vif.drv_cb.enq_uops_unsafe[i]         <= 0;
+      end
+      vif.drv_cb.enq_partial_stall <= 0;
+      vif.drv_cb.xcpt_fetch_pc     <= 0;
+      vif.drv_cb.brupdate_b1_resolve_mask    <= 0;
+      vif.drv_cb.brupdate_b1_mispredict_mask <= 0;
+      vif.drv_cb.brupdate_b2_uop_rob_idx     <= 0;
+      vif.drv_cb.brupdate_b2_mispredict       <= 0;
+      vif.drv_cb.brupdate_b2_taken            <= 0;
+      for (int i = 0; i < 10; i++) begin
+        vif.drv_cb.wb_resps_valid[i]       <= 0;
+        vif.drv_cb.wb_resps_rob_idx[i]     <= 0;
+        vif.drv_cb.wb_resps_pdst[i]        <= 0;
+        vif.drv_cb.wb_resps_predicated[i]  <= 0;
+        vif.drv_cb.debug_wb_valids[i]      <= 0;
+        vif.drv_cb.debug_wb_wdata[i]       <= 0;
+      end
+      for (int i = 0; i < 3; i++) begin
+        vif.drv_cb.lsu_clr_bsy_valid[i] <= 0;
+        vif.drv_cb.lsu_clr_bsy_bits[i]  <= 0;
+      end
+      for (int i = 0; i < 2; i++) begin
+        vif.drv_cb.lsu_clr_unsafe_valid[i] <= 0;
+        vif.drv_cb.lsu_clr_unsafe_bits[i]  <= 0;
+      end
+      vif.drv_cb.fflags_0_valid <= 0; vif.drv_cb.fflags_0_uop_rob_idx <= 0; vif.drv_cb.fflags_0_bits_flags <= 0;
+      vif.drv_cb.fflags_2_valid <= 0; vif.drv_cb.fflags_2_uop_rob_idx <= 0; vif.drv_cb.fflags_2_bits_flags <= 0;
+      vif.drv_cb.fflags_3_valid <= 0; vif.drv_cb.fflags_3_uop_rob_idx <= 0; vif.drv_cb.fflags_3_bits_flags <= 0;
+      vif.drv_cb.lxcpt_valid              <= 0;
+      vif.drv_cb.lxcpt_bits_uop_br_mask   <= 0;
+      vif.drv_cb.lxcpt_bits_uop_rob_idx   <= 0;
+      vif.drv_cb.lxcpt_bits_cause          <= 0;
+      vif.drv_cb.lxcpt_bits_badvaddr       <= 0;
+      vif.drv_cb.csr_stall <= 0;
+      vif.drv_cb.debug_tsc <= 0;
+    endtask
+
+    // ==========================================================
+    // Drive tasks — giữ nguyên bản cũ
+    // ==========================================================
+    task drive_dispatch(rob_transaction tr);
+      for (int i = 0; i < 4; i++) begin
+        vif.drv_cb.enq_valids[i]              <= tr.enq_valids[i];
+        vif.drv_cb.enq_uops_uopc[i]           <= tr.enq_uops_uopc[i];
+        vif.drv_cb.enq_uops_rob_idx[i]        <= tr.enq_uops_rob_idx[i];
+        vif.drv_cb.enq_uops_pdst[i]           <= tr.enq_uops_pdst[i];
+        vif.drv_cb.enq_uops_stale_pdst[i]     <= tr.enq_uops_stale_pdst[i];
+        vif.drv_cb.enq_uops_exception[i]      <= tr.enq_uops_exception[i];
+        vif.drv_cb.enq_uops_exc_cause[i]      <= tr.enq_uops_exc_cause[i];
+        vif.drv_cb.enq_uops_is_br[i]          <= tr.enq_uops_is_br[i];
+        vif.drv_cb.enq_uops_br_mask[i]        <= tr.enq_uops_br_mask[i];
+        vif.drv_cb.enq_uops_is_fence[i]       <= tr.enq_uops_is_fence[i];
+        vif.drv_cb.enq_uops_is_fencei[i]      <= tr.enq_uops_is_fencei[i];
+        vif.drv_cb.enq_uops_unsafe[i]         <= tr.enq_uops_unsafe[i];
+        vif.drv_cb.enq_uops_uses_ldq[i]       <= tr.enq_uops_uses_ldq[i];
+        vif.drv_cb.enq_uops_uses_stq[i]       <= tr.enq_uops_uses_stq[i];
+        vif.drv_cb.enq_uops_is_unique[i]      <= tr.enq_uops_is_unique[i];
+        vif.drv_cb.enq_uops_flush_on_commit[i]<= tr.enq_uops_flush_on_commit[i];
+        vif.drv_cb.enq_uops_ldst[i]           <= tr.enq_uops_ldst[i];
+        vif.drv_cb.enq_uops_ldst_val[i]       <= tr.enq_uops_ldst_val[i];
+        vif.drv_cb.enq_uops_dst_rtype[i]      <= tr.enq_uops_dst_rtype[i];
+        vif.drv_cb.enq_uops_fp_val[i]         <= tr.enq_uops_fp_val[i];
+        vif.drv_cb.enq_uops_pc_lob[i]         <= tr.enq_uops_pc_lob[i];
+        vif.drv_cb.enq_uops_ftq_idx[i]        <= tr.enq_uops_ftq_idx[i];
+      end
+      vif.drv_cb.enq_partial_stall <= tr.enq_partial_stall;
+    endtask
+
+    task drive_writeback(rob_transaction tr);
+      for (int i = 0; i < 10; i++) begin
+        vif.drv_cb.wb_resps_valid[i]   <= tr.wb_valid[i];
+        vif.drv_cb.wb_resps_rob_idx[i] <= tr.wb_rob_idx[i];
+        vif.drv_cb.wb_resps_pdst[i]    <= tr.wb_pdst[i];
+        vif.drv_cb.debug_wb_valids[i]  <= tr.wb_valid[i];
+      end
+    endtask
+
+    task drive_branch_update(rob_transaction tr);
+      vif.drv_cb.brupdate_b1_resolve_mask    <= tr.br_resolve_mask;
+      vif.drv_cb.brupdate_b1_mispredict_mask <= tr.br_mispredict_mask;
+      vif.drv_cb.brupdate_b2_uop_rob_idx     <= tr.br_rob_idx;
+      vif.drv_cb.brupdate_b2_mispredict       <= tr.br_mispredict;
+      vif.drv_cb.brupdate_b2_taken            <= tr.br_taken;
+    endtask
+
+    task drive_lxcpt(rob_transaction tr);
+      vif.drv_cb.lxcpt_valid              <= tr.lxcpt_valid;
+      vif.drv_cb.lxcpt_bits_uop_br_mask   <= tr.lxcpt_br_mask;
+      vif.drv_cb.lxcpt_bits_uop_rob_idx   <= tr.lxcpt_rob_idx;
+      vif.drv_cb.lxcpt_bits_cause          <= tr.lxcpt_cause;
+      vif.drv_cb.lxcpt_bits_badvaddr       <= tr.lxcpt_badvaddr;
+    endtask
+
+    task drive_lsu_clr(rob_transaction tr);
+      for (int i = 0; i < 3; i++) begin
+        vif.drv_cb.lsu_clr_bsy_valid[i] <= tr.lsu_clr_valid[i];
+        vif.drv_cb.lsu_clr_bsy_bits[i]  <= tr.lsu_clr_bits[i];
+      end
+    endtask
+  endclass
