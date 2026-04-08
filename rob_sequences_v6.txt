@@ -1,0 +1,745 @@
+`define CW 4
+
+  // ================================================================
+  // Quy tắc rob_idx:
+  //   - rob_idx lấy từ io_rob_tail_idx của DUT tại thời điểm dispatch
+  //   - Dispatch 1 uop:  rob_idx = tail
+  //   - Dispatch N uop cùng cycle: bank b → rob_idx = tail + b
+  //   - SAU dispatch (nếu !partial_stall), DUT tự tăng tail
+  //
+  // Quy tắc ftq_idx:
+  //   - Hoàn toàn độc lập với rob_idx
+  //   - Là index vào Fetch Target Queue, sequence tự quản lý
+  //   - Tăng dần mỗi dispatch group (cùng row share 1 ftq_idx)
+  // ================================================================
+
+  class rob_seq_utils;
+
+    // ----------------------------------------------------------
+    // Full dispatch row builder
+    //
+    // tail_idx: đọc từ DUT io_rob_tail_idx TRƯỚC khi gọi
+    // ftq:      giá trị ftq_idx cho cả row (tự quản lý)
+    // ----------------------------------------------------------
+    static function void build_dispatch_row(
+      ref rob_transaction  tr,
+      input bit [6:0]      tail_idx,       // rob_tail_idx đọc từ DUT
+      input int unsigned   ftq,            // ftq_idx (independent)
+      input int unsigned   num_valid,      // 1–4
+      input bit            partial,
+      input bit [6:0]      pdst_arr      [4],
+      input bit [6:0]      stale_pdst_arr[4],
+      input bit            is_br_arr     [4],
+      input bit [19:0]     br_mask_arr   [4],
+      input bit            exception_arr [4],
+      input bit [63:0]     exc_cause_arr [4],
+      input bit            unsafe_arr    [4],
+      input bit            uses_ldq_arr  [4],
+      input bit            uses_stq_arr  [4],
+      input bit [5:0]      ldst_arr      [4],
+      input bit            ldst_val_arr  [4],
+      input bit [1:0]      dst_rtype_arr [4],
+      input bit            fp_val_arr    [4]
+    );
+      tr.op = ROB_DISPATCH;
+      tr.enq_partial_stall = partial;
+
+      for (int b = 0; b < `CW; b++) begin
+        tr.enq_valids[b] = (b < num_valid) ? 1'b1 : 1'b0;
+
+        // rob_idx = tail + bank offset
+        tr.enq_uops_rob_idx[b] = 7'(tail_idx + b);
+
+        // ftq_idx: cả row share cùng 1 giá trị
+        tr.enq_uops_ftq_idx[b] = 6'(ftq);
+
+        // pc_lob: bank offset trong fetch packet (mỗi lệnh 4 byte)
+        tr.enq_uops_pc_lob[b] = 6'(b * 4);
+
+        // Opcode giả
+        tr.enq_uops_uopc[b] = 7'((tail_idx + b) % 128);
+
+        // Fields
+        tr.enq_uops_pdst[b]           = pdst_arr[b];
+        tr.enq_uops_stale_pdst[b]     = stale_pdst_arr[b];
+        tr.enq_uops_ldst[b]           = ldst_arr[b];
+        tr.enq_uops_ldst_val[b]       = ldst_val_arr[b];
+        tr.enq_uops_dst_rtype[b]      = dst_rtype_arr[b];
+        tr.enq_uops_fp_val[b]         = fp_val_arr[b];
+        tr.enq_uops_is_br[b]          = is_br_arr[b];
+        tr.enq_uops_br_mask[b]        = br_mask_arr[b];
+        tr.enq_uops_exception[b]      = exception_arr[b];
+        tr.enq_uops_exc_cause[b]      = exc_cause_arr[b];
+        tr.enq_uops_uses_ldq[b]       = uses_ldq_arr[b];
+        tr.enq_uops_uses_stq[b]       = uses_stq_arr[b];
+        tr.enq_uops_unsafe[b]         = unsafe_arr[b];
+        tr.enq_uops_is_fence[b]       = 1'b0;
+        tr.enq_uops_is_fencei[b]      = 1'b0;
+        tr.enq_uops_is_unique[b]      = 1'b0;
+        tr.enq_uops_flush_on_commit[b]= 1'b0;
+      end
+    endfunction
+
+    // ----------------------------------------------------------
+    // Rút gọn: dispatch row sạch
+    // ----------------------------------------------------------
+    static function void build_clean_row(
+      ref rob_transaction tr,
+      input bit [6:0]     tail_idx,
+      input int unsigned  ftq,
+      input int unsigned  num_valid = 4,
+      input bit           partial   = 0,
+      input bit [6:0]     pdst_base = 7'd10
+    );
+      bit [6:0]  pdst_a[4], stale_a[4];
+      bit        z1[4];
+      bit [19:0] zm[4];
+      bit [63:0] z64[4];
+      bit        uns[4];
+      bit [5:0]  ld[4];
+      bit        lv[4];
+      bit [1:0]  rt[4];
+      bit        fp[4];
+      for (int b = 0; b < 4; b++) begin
+        pdst_a[b]  = 7'(pdst_base + b);
+        stale_a[b] = 7'(b);
+        z1[b] = 0; zm[b] = 0; z64[b] = 0;
+        uns[b] = 1; ld[b] = 6'(b); lv[b] = 1;
+        rt[b] = 2'b01; fp[b] = 0;
+      end
+      build_dispatch_row(tr, tail_idx, ftq, num_valid, partial,
+        pdst_a, stale_a, z1, zm, z1, z64, uns, z1, z1, ld, lv, rt, fp);
+    endfunction
+
+  endclass
+
+
+  // Rule checker (giữ nguyên)
+  class rob_rule_checker;
+    static function void check_dispatch_ready(virtual rob_if.MON vif, string tc);
+      if (!vif.mon_cb.ready)
+        `uvm_error(tc, "RULE D3: Dispatching while io_ready=0!")
+    endfunction
+
+    static function void check_wb_entry_state(rob_driver drv, rob_transaction tr, string tc);
+      for (int i = 0; i < 10; i++)
+        if (tr.wb_valid[i] && !drv.can_writeback(tr.wb_rob_idx[i]))
+          `uvm_error(tc, $sformatf("RULE W1/W2: WB rob_idx=%0d invalid or not busy", tr.wb_rob_idx[i]))
+    endfunction
+
+    static function void check_wb_pdst(rob_driver drv, rob_transaction tr, string tc);
+      for (int i = 0; i < 10; i++)
+        if (tr.wb_valid[i] && !drv.check_pdst_match(tr.wb_rob_idx[i], tr.wb_pdst[i]))
+          `uvm_error(tc, $sformatf("RULE W3: WB pdst mismatch at rob_idx=%0d", tr.wb_rob_idx[i]))
+    endfunction
+  endclass
+
+
+  // ================================================================
+  // TESTCASE 1: Dispatch / Allocation
+  // ================================================================
+  class tc1_dispatch_seq extends uvm_sequence #(rob_transaction);
+    `uvm_object_utils(tc1_dispatch_seq)
+    virtual rob_if.MON vif;
+    function new(string name = "tc1_dispatch_seq"); super.new(name); endfunction
+
+    task body();
+      rob_transaction tr;
+      bit [6:0] cur_tail;
+      int ftq = 0;
+
+      if (!uvm_config_db#(virtual rob_if.MON)::get(null, "", "vif", vif))
+        `uvm_fatal("TC1", "Cannot get vif")
+
+      `uvm_info("TC1", "========== TC1: DISPATCH ALLOCATION ==========", UVM_LOW)
+
+      // Phase A: Partial dispatch test
+      // Step 1: dispatch bank 0 only, partial_stall=1 → tail giữ nguyên
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC1");
+      cur_tail = vif.mon_cb.rob_tail_idx;
+      `uvm_info("TC1", $sformatf("[A1] 1 uop partial_stall=1, tail=%0d", cur_tail), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd1, 0, 0, 0};
+        bit [6:0]  sa[4]  = '{0, 0, 0, 0};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [19:0] zm[4]  = '{0, 0, 0, 0};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{1, 0, 0, 0};
+        bit [5:0]  ld[4]  = '{6'd1, 0, 0, 0};
+        bit        lv[4]  = '{1, 0, 0, 0};
+        bit [1:0]  rt[4]  = '{2'b01, 0, 0, 0};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, cur_tail, ftq, 1, 1,  // num_valid=1, partial=1
+          pa, sa, z1, zm, z1, z64, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      // ftq KHÔNG tăng — vẫn cùng fetch packet
+
+      // Step 2: Hoàn thành row — dispatch bank 1,2,3, partial_stall=0 → tail tiến
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC1");
+      cur_tail = vif.mon_cb.rob_tail_idx;  // vẫn cùng row (tail chưa tiến)
+      `uvm_info("TC1", $sformatf("[A2] Complete row: bank 1,2,3, stall=0, tail=%0d", cur_tail), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        // bank 0: INVALID (đã dispatch rồi), bank 1,2,3: valid
+        bit [6:0]  pa[4]  = '{0, 7'd2, 7'd3, 7'd4};
+        bit [6:0]  sa[4]  = '{0, 0, 0, 0};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [19:0] zm[4]  = '{0, 0, 0, 0};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{0, 1, 1, 1};
+        bit [5:0]  ld[4]  = '{0, 6'd2, 6'd3, 6'd4};
+        bit        lv[4]  = '{0, 1, 1, 1};
+        bit [1:0]  rt[4]  = '{0, 2'b01, 2'b01, 2'b01};
+        bit        fp[4]  = '{0, 0, 0, 0};
+
+        tr.op = ROB_DISPATCH;
+        tr.enq_partial_stall = 0;  // row hoàn thành → tail tiến
+
+        // bank 0: NOT valid (đã có từ step 1)
+        tr.enq_valids[0] = 0;
+        tr.enq_valids[1] = 1;
+        tr.enq_valids[2] = 1;
+        tr.enq_valids[3] = 1;
+
+        for (int b = 0; b < 4; b++) begin
+          tr.enq_uops_rob_idx[b]        = 7'(cur_tail + b);
+          tr.enq_uops_ftq_idx[b]        = 6'(ftq);    // cùng fetch packet
+          tr.enq_uops_pc_lob[b]         = 6'(b * 4);
+          tr.enq_uops_uopc[b]           = 7'((cur_tail + b) % 128);
+          tr.enq_uops_pdst[b]           = pa[b];
+          tr.enq_uops_stale_pdst[b]     = sa[b];
+          tr.enq_uops_ldst[b]           = ld[b];
+          tr.enq_uops_ldst_val[b]       = lv[b];
+          tr.enq_uops_dst_rtype[b]      = rt[b];
+          tr.enq_uops_fp_val[b]         = fp[b];
+          tr.enq_uops_is_br[b]          = z1[b];
+          tr.enq_uops_br_mask[b]        = zm[b];
+          tr.enq_uops_exception[b]      = z1[b];
+          tr.enq_uops_exc_cause[b]      = z64[b];
+          tr.enq_uops_uses_ldq[b]       = z1[b];
+          tr.enq_uops_uses_stq[b]       = z1[b];
+          tr.enq_uops_unsafe[b]         = un[b];
+          tr.enq_uops_is_fence[b]       = 0;
+          tr.enq_uops_is_fencei[b]      = 0;
+          tr.enq_uops_is_unique[b]      = 0;
+          tr.enq_uops_flush_on_commit[b]= 0;
+        end
+      end
+      finish_item(tr);
+      ftq++;  // fetch packet hoàn thành → tăng ftq
+
+      // Phase B: Full-width × 10 rows
+      `uvm_info("TC1", "[B] 4 uops x 10 rows", UVM_LOW)
+      for (int r = 0; r < 10; r++) begin
+        @(posedge vif.clock);
+        rob_rule_checker::check_dispatch_ready(vif, "TC1");
+        cur_tail = vif.mon_cb.rob_tail_idx;  // đọc tail mới nhất
+
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr);
+        rob_seq_utils::build_clean_row(
+          tr, cur_tail, ftq, 4, 0,
+          7'((r * `CW + 10) % 128));
+        finish_item(tr);
+        ftq++;
+      end
+
+      @(posedge vif.clock);
+      `uvm_info("TC1", $sformatf("[B] tail=%0d head=%0d ready=%0b empty=%0b",
+        vif.mon_cb.rob_tail_idx, vif.mon_cb.rob_head_idx,
+        vif.mon_cb.ready, vif.mon_cb.empty), UVM_LOW)
+
+      // Phase C: Fill until not ready
+      `uvm_info("TC1", "[C] Fill until io_ready=0", UVM_LOW)
+      for (int r = 0; r < 50; r++) begin
+        @(posedge vif.clock);
+        if (!vif.mon_cb.ready) begin
+          `uvm_info("TC1", $sformatf("[C] PASS: io_ready=0, ROB full"), UVM_LOW)
+          break;
+        end
+        cur_tail = vif.mon_cb.rob_tail_idx;
+
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr);
+        rob_seq_utils::build_clean_row(
+          tr, cur_tail, ftq, 4, 0,
+          7'((r * `CW) % 128));
+        finish_item(tr);
+        ftq++;
+      end
+
+      repeat(5) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+      end
+      `uvm_info("TC1", "========== TC1 COMPLETE ==========", UVM_LOW)
+    endtask
+  endclass
+
+
+  // ================================================================
+  // TESTCASE 2: Out-of-Order Writeback
+  // ================================================================
+  class tc2_ooo_writeback_seq extends uvm_sequence #(rob_transaction);
+    `uvm_object_utils(tc2_ooo_writeback_seq)
+    virtual rob_if.MON vif;
+    function new(string name = "tc2_ooo_writeback_seq"); super.new(name); endfunction
+
+    task body();
+      rob_transaction tr;
+      rob_driver drv;
+      bit [6:0] cur_tail;
+      bit [6:0] old_idx, young_idx;  // ghi nhớ rob_idx để WB đúng
+      int ftq = 0;
+
+      if (!uvm_config_db#(virtual rob_if.MON)::get(null, "", "vif", vif))
+        `uvm_fatal("TC2", "Cannot get vif")
+      begin
+        uvm_component comp = uvm_top.find("*.agt.drv");
+        if (!$cast(drv, comp)) `uvm_fatal("TC2", "Driver cast failed")
+      end
+
+      `uvm_info("TC2", "========== TC2: OUT-OF-ORDER WRITEBACK ==========", UVM_LOW)
+
+      // Dispatch row: 2 uops
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC2");
+      cur_tail = vif.mon_cb.rob_tail_idx;
+      old_idx   = cur_tail;          // bank 0 = OLD
+      young_idx = cur_tail + 7'd1;   // bank 1 = YOUNG
+      `uvm_info("TC2", $sformatf("Dispatch: tail=%0d → old_idx=%0d, young_idx=%0d",
+        cur_tail, old_idx, young_idx), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd10, 7'd11, 0, 0};
+        bit [6:0]  sa[4]  = '{0, 0, 0, 0};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [19:0] zm[4]  = '{0, 0, 0, 0};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{1, 1, 0, 0};
+        bit [5:0]  ld[4]  = '{6'd1, 6'd2, 0, 0};
+        bit        lv[4]  = '{1, 1, 0, 0};
+        bit [1:0]  rt[4]  = '{2'b01, 2'b01, 0, 0};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, cur_tail, ftq, 2, 0,
+          pa, sa, z1, zm, z1, z64, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      ftq++;
+
+      // [T1] idle gap
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+
+      // WB YOUNG first (dùng young_idx đã ghi nhớ)
+      `uvm_info("TC2", $sformatf("WB young rob_idx=%0d first", young_idx), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for (int i = 0; i < 10; i++) tr.wb_valid[i] = 0;
+      tr.wb_valid[0] = 1; tr.wb_rob_idx[0] = young_idx; tr.wb_pdst[0] = 7'd11;
+      rob_rule_checker::check_wb_entry_state(drv, tr, "TC2");
+      rob_rule_checker::check_wb_pdst(drv, tr, "TC2");
+      finish_item(tr);
+
+      @(posedge vif.clock);
+      if (vif.mon_cb.commit_valids[0] | vif.mon_cb.commit_valids[1] |
+          vif.mon_cb.commit_valids[2] | vif.mon_cb.commit_valids[3])
+        `uvm_error("TC2", "FAIL: Premature commit!")
+      else
+        `uvm_info("TC2", "PASS: No commit (old still busy)", UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+
+      // WB OLD (dùng old_idx đã ghi nhớ)
+      `uvm_info("TC2", $sformatf("WB old rob_idx=%0d", old_idx), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for (int i = 0; i < 10; i++) tr.wb_valid[i] = 0;
+      tr.wb_valid[0] = 1; tr.wb_rob_idx[0] = old_idx; tr.wb_pdst[0] = 7'd10;
+      rob_rule_checker::check_wb_entry_state(drv, tr, "TC2");
+      rob_rule_checker::check_wb_pdst(drv, tr, "TC2");
+      finish_item(tr);
+
+      repeat(4) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+        @(posedge vif.clock);
+        if (vif.mon_cb.commit_valids[0] | vif.mon_cb.commit_valids[1])
+          `uvm_info("TC2", $sformatf("PASS: Commit, head=%0d", vif.mon_cb.rob_head_idx), UVM_LOW)
+      end
+      `uvm_info("TC2", "========== TC2 COMPLETE ==========", UVM_LOW)
+    endtask
+  endclass
+
+
+  // ================================================================
+  // TESTCASE 3: In-Order Commit
+  // ================================================================
+  class tc3_inorder_commit_seq extends uvm_sequence #(rob_transaction);
+    `uvm_object_utils(tc3_inorder_commit_seq)
+    virtual rob_if.MON vif;
+    function new(string name = "tc3_inorder_commit_seq"); super.new(name); endfunction
+
+    task body();
+      rob_transaction tr;
+      rob_driver drv;
+      bit [6:0] tail_row0, tail_row1;
+      int ftq = 0;
+
+      if (!uvm_config_db#(virtual rob_if.MON)::get(null, "", "vif", vif))
+        `uvm_fatal("TC3", "Cannot get vif")
+      begin
+        uvm_component comp = uvm_top.find("*.agt.drv");
+        if (!$cast(drv, comp)) `uvm_fatal("TC3", "Driver cast failed")
+      end
+
+      `uvm_info("TC3", "========== TC3: IN-ORDER COMMIT ==========", UVM_LOW)
+
+      // Dispatch row 0
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC3");
+      tail_row0 = vif.mon_cb.rob_tail_idx;
+      `uvm_info("TC3", $sformatf("Row 0: tail=%0d", tail_row0), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      rob_seq_utils::build_clean_row(tr, tail_row0, ftq, 4, 0, 7'd10);
+      finish_item(tr);
+      ftq++;
+
+      // Dispatch row 1
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC3");
+      tail_row1 = vif.mon_cb.rob_tail_idx;
+      `uvm_info("TC3", $sformatf("Row 1: tail=%0d", tail_row1), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      rob_seq_utils::build_clean_row(tr, tail_row1, ftq, 4, 0, 7'd20);
+      finish_item(tr);
+      ftq++;
+
+      // [T1] idle
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+
+      // WB all 8 — dùng tail_row0, tail_row1 đã ghi nhớ
+      `uvm_info("TC3", $sformatf("WB 8 uops: row0 idx %0d-%0d, row1 idx %0d-%0d",
+        tail_row0, tail_row0+3, tail_row1, tail_row1+3), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for (int i = 0; i < 10; i++) tr.wb_valid[i] = 0;
+      // Row 0: 4 uops
+      for (int b = 0; b < 4; b++) begin
+        tr.wb_valid[b]   = 1;
+        tr.wb_rob_idx[b] = 7'(tail_row0 + b);
+        tr.wb_pdst[b]    = 7'(10 + b);
+      end
+      // Row 1: 4 uops
+      for (int b = 0; b < 4; b++) begin
+        tr.wb_valid[4+b]   = 1;
+        tr.wb_rob_idx[4+b] = 7'(tail_row1 + b);
+        tr.wb_pdst[4+b]    = 7'(20 + b);
+      end
+      rob_rule_checker::check_wb_entry_state(drv, tr, "TC3");
+      rob_rule_checker::check_wb_pdst(drv, tr, "TC3");
+      finish_item(tr);
+
+      repeat(6) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+        @(posedge vif.clock);
+        if (vif.mon_cb.commit_valids[0] | vif.mon_cb.commit_valids[1] |
+            vif.mon_cb.commit_valids[2] | vif.mon_cb.commit_valids[3])
+          `uvm_info("TC3", $sformatf("COMMIT head=%0d", vif.mon_cb.rob_head_idx), UVM_LOW)
+      end
+
+      @(posedge vif.clock);
+      if (vif.mon_cb.empty)
+        `uvm_info("TC3", "PASS: ROB empty", UVM_LOW)
+      else
+        `uvm_error("TC3", "FAIL: ROB not empty")
+
+      `uvm_info("TC3", "========== TC3 COMPLETE ==========", UVM_LOW)
+    endtask
+  endclass
+
+
+  // ================================================================
+  // TESTCASE 4: Precise Exception
+  // ================================================================
+  class tc4_precise_exception_seq extends uvm_sequence #(rob_transaction);
+    `uvm_object_utils(tc4_precise_exception_seq)
+    virtual rob_if.MON vif;
+    function new(string name = "tc4_precise_exception_seq"); super.new(name); endfunction
+
+    task body();
+      rob_transaction tr;
+      rob_driver drv;
+      bit [6:0] tail_row0, tail_row1;
+      int ftq = 0;
+      bit xcpt_seen = 0, flush_seen = 0;
+
+      if (!uvm_config_db#(virtual rob_if.MON)::get(null, "", "vif", vif))
+        `uvm_fatal("TC4", "Cannot get vif")
+      begin
+        uvm_component comp = uvm_top.find("*.agt.drv");
+        if (!$cast(drv, comp)) `uvm_fatal("TC4", "Driver cast failed")
+      end
+
+      `uvm_info("TC4", "========== TC4: PRECISE EXCEPTION ==========", UVM_LOW)
+
+      // Row 0: bank0 = exception
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC4");
+      tail_row0 = vif.mon_cb.rob_tail_idx;
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd10, 7'd11, 7'd12, 7'd13};
+        bit [6:0]  sa[4]  = '{0, 7'd1, 7'd2, 7'd3};
+        bit        br[4]  = '{0, 0, 0, 0};
+        bit [19:0] bm[4]  = '{0, 0, 0, 0};
+        bit        ex[4]  = '{1, 0, 0, 0};
+        bit [63:0] ca[4]  = '{64'd13, 0, 0, 0};
+        bit        un[4]  = '{0, 1, 1, 1};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [5:0]  ld[4]  = '{6'd1, 6'd2, 6'd3, 6'd4};
+        bit        lv[4]  = '{1, 1, 1, 1};
+        bit [1:0]  rt[4]  = '{2'b01, 2'b01, 2'b01, 2'b01};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, tail_row0, ftq, 4, 0,
+          pa, sa, br, bm, ex, ca, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      ftq++;
+
+      // Row 1: clean
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC4");
+      tail_row1 = vif.mon_cb.rob_tail_idx;
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      rob_seq_utils::build_clean_row(tr, tail_row1, ftq, 4, 0, 7'd20);
+      finish_item(tr);
+      ftq++;
+
+      // [T1] idle
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+
+      // WB row 1 trước
+      `uvm_info("TC4", $sformatf("WB row 1 (idx %0d-%0d)", tail_row1, tail_row1+3), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for (int i = 0; i < 10; i++) tr.wb_valid[i] = 0;
+      for (int b = 0; b < 4; b++) begin
+        tr.wb_valid[b] = 1; tr.wb_rob_idx[b] = 7'(tail_row1+b); tr.wb_pdst[b] = 7'(20+b);
+      end
+      rob_rule_checker::check_wb_entry_state(drv, tr, "TC4");
+      finish_item(tr);
+
+      repeat(2) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+      end
+
+      // WB row 0
+      `uvm_info("TC4", $sformatf("WB row 0 (idx %0d-%0d, includes exception)", tail_row0, tail_row0+3), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_WRITEBACK;
+      for (int i = 0; i < 10; i++) tr.wb_valid[i] = 0;
+      for (int b = 0; b < 4; b++) begin
+        tr.wb_valid[b] = 1; tr.wb_rob_idx[b] = 7'(tail_row0+b); tr.wb_pdst[b] = 7'(10+b);
+      end
+      rob_rule_checker::check_wb_entry_state(drv, tr, "TC4");
+      finish_item(tr);
+
+      // [T2,T3] Chờ exception + flush
+      repeat(8) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+        @(posedge vif.clock);
+        if (vif.mon_cb.com_xcpt_valid && !xcpt_seen) begin
+          `uvm_info("TC4", $sformatf("PASS: com_xcpt_valid=1 head=%0d", vif.mon_cb.rob_head_idx), UVM_LOW)
+          xcpt_seen = 1;
+        end
+        if (vif.mon_cb.flush_valid && !flush_seen) begin
+          `uvm_info("TC4", $sformatf("PASS: flush_valid=1 typ=%0d", vif.mon_cb.flush_bits_flush_typ), UVM_LOW)
+          flush_seen = 1;
+        end
+      end
+
+      if (!xcpt_seen) `uvm_error("TC4", "FAIL: com_xcpt_valid never asserted")
+      if (!flush_seen) `uvm_error("TC4", "FAIL: flush_valid never asserted")
+
+      repeat(20) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+      end
+      `uvm_info("TC4", "========== TC4 COMPLETE ==========", UVM_LOW)
+    endtask
+  endclass
+
+
+  // ================================================================
+  // TESTCASE 5: Branch Misprediction Recovery
+  // ================================================================
+  class tc5_branch_mispredict_seq extends uvm_sequence #(rob_transaction);
+    `uvm_object_utils(tc5_branch_mispredict_seq)
+    virtual rob_if.MON vif;
+    function new(string name = "tc5_branch_mispredict_seq"); super.new(name); endfunction
+
+    task body();
+      rob_transaction tr;
+      bit [6:0] tail_row0, tail_row1, tail_row2;
+      bit [6:0] branch_rob_idx;
+      logic [6:0] tail_before;
+      int ftq = 0;
+
+      if (!uvm_config_db#(virtual rob_if.MON)::get(null, "", "vif", vif))
+        `uvm_fatal("TC5", "Cannot get vif")
+
+      `uvm_info("TC5", "========== TC5: BRANCH MISPREDICTION ==========", UVM_LOW)
+
+      // Row 0: bank0 = branch
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC5");
+      tail_row0 = vif.mon_cb.rob_tail_idx;
+      branch_rob_idx = tail_row0;  // ghi nhớ rob_idx của branch
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd10, 7'd11, 7'd12, 7'd13};
+        bit [6:0]  sa[4]  = '{0, 7'd1, 7'd2, 7'd3};
+        bit        br[4]  = '{1, 0, 0, 0};
+        bit [19:0] bm[4]  = '{20'h1, 20'h1, 20'h1, 20'h1};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{1, 1, 1, 1};
+        bit [5:0]  ld[4]  = '{6'd1, 6'd2, 6'd3, 6'd4};
+        bit        lv[4]  = '{1, 1, 1, 1};
+        bit [1:0]  rt[4]  = '{2'b01, 2'b01, 2'b01, 2'b01};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, tail_row0, ftq, 4, 0,
+          pa, sa, br, bm, z1, z64, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      ftq++;
+
+      // Row 1: speculative
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC5");
+      tail_row1 = vif.mon_cb.rob_tail_idx;
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd20, 7'd21, 7'd22, 7'd23};
+        bit [6:0]  sa[4]  = '{7'd10, 7'd11, 7'd12, 7'd13};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [19:0] bm[4]  = '{20'h1, 20'h1, 20'h1, 20'h1};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{1, 1, 1, 1};
+        bit [5:0]  ld[4]  = '{6'd5, 6'd6, 6'd7, 6'd8};
+        bit        lv[4]  = '{1, 1, 1, 1};
+        bit [1:0]  rt[4]  = '{2'b01, 2'b01, 2'b01, 2'b01};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, tail_row1, ftq, 4, 0,
+          pa, sa, z1, bm, z1, z64, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      ftq++;
+
+      // Row 2: more speculative
+      @(posedge vif.clock);
+      rob_rule_checker::check_dispatch_ready(vif, "TC5");
+      tail_row2 = vif.mon_cb.rob_tail_idx;
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      begin
+        bit [6:0]  pa[4]  = '{7'd30, 7'd31, 7'd32, 7'd33};
+        bit [6:0]  sa[4]  = '{7'd20, 7'd21, 7'd22, 7'd23};
+        bit        z1[4]  = '{0, 0, 0, 0};
+        bit [19:0] bm[4]  = '{20'h1, 20'h1, 20'h1, 20'h1};
+        bit [63:0] z64[4] = '{0, 0, 0, 0};
+        bit        un[4]  = '{1, 1, 1, 1};
+        bit [5:0]  ld[4]  = '{6'd9, 6'd10, 6'd11, 6'd12};
+        bit        lv[4]  = '{1, 1, 1, 1};
+        bit [1:0]  rt[4]  = '{2'b01, 2'b01, 2'b01, 2'b01};
+        bit        fp[4]  = '{0, 0, 0, 0};
+        rob_seq_utils::build_dispatch_row(
+          tr, tail_row2, ftq, 4, 0,
+          pa, sa, z1, bm, z1, z64, un, z1, z1, ld, lv, rt, fp);
+      end
+      finish_item(tr);
+      ftq++;
+
+      @(posedge vif.clock);
+      tail_before = vif.mon_cb.rob_tail_idx;
+      `uvm_info("TC5", $sformatf("Before mispredict: tail=%0d head=%0d, branch at rob_idx=%0d",
+        tail_before, vif.mon_cb.rob_head_idx, branch_rob_idx), UVM_LOW)
+
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+
+      // Mispredict — dùng branch_rob_idx đã ghi nhớ
+      `uvm_info("TC5", $sformatf(">>> Mispredict on rob_idx=%0d <<<", branch_rob_idx), UVM_LOW)
+      tr = rob_transaction::type_id::create("tr");
+      start_item(tr);
+      tr.op = ROB_BRANCH_UPDATE;
+      tr.br_resolve_mask = 20'h1; tr.br_mispredict_mask = 20'h1;
+      tr.br_rob_idx = branch_rob_idx;
+      tr.br_mispredict = 1; tr.br_taken = 1;
+      finish_item(tr);
+
+      // [W5] Chỉ idle — KHÔNG WB cho killed entries
+      repeat(10) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+        @(posedge vif.clock);
+        `uvm_info("TC5", $sformatf("  tail=%0d head=%0d rbk=%0b empty=%0b",
+          vif.mon_cb.rob_tail_idx, vif.mon_cb.rob_head_idx,
+          vif.mon_cb.commit_rollback, vif.mon_cb.empty), UVM_MEDIUM)
+      end
+
+      @(posedge vif.clock);
+      if (vif.mon_cb.rob_tail_idx < tail_before)
+        `uvm_info("TC5", $sformatf("PASS: Tail %0d->%0d", tail_before, vif.mon_cb.rob_tail_idx), UVM_LOW)
+      else if (vif.mon_cb.empty)
+        `uvm_info("TC5", "PASS: ROB drained", UVM_LOW)
+      else
+        `uvm_warning("TC5", $sformatf("CHECK: tail=%0d (was %0d)", vif.mon_cb.rob_tail_idx, tail_before))
+
+      repeat(10) begin
+        tr = rob_transaction::type_id::create("tr");
+        start_item(tr); tr.op = ROB_IDLE; finish_item(tr);
+      end
+      `uvm_info("TC5", "========== TC5 COMPLETE ==========", UVM_LOW)
+    endtask
+  endclass
